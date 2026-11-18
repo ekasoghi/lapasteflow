@@ -1,10 +1,12 @@
 /* lp-build: saas-2026.10
  * OTP masuk (verifikasi 2 langkah) + animasi kubus Rubik – La Paste Bazzar Management
- * Menggantikan srvLogin: bila server meminta OTP, tampilkan 6 kotak kode; setelah benar, kotak terlipat menjadi kubus Rubik lalu masuk ke dashboard.
+ * Dipakai di aplikasi bazzar (menggantikan srvLogin) dan Konsol Platform (menggantikan F.login): bila server meminta OTP, tampilkan 6 kotak kode; setelah benar, kotak terlipat menjadi kubus Rubik lalu masuk ke dashboard.
  */
 (function () {
   'use strict';
-  if (typeof srvLogin !== 'function' || typeof api !== 'function') return;
+  const IS_APP = typeof srvLogin === 'function' && typeof pull === 'function' && typeof api === 'function';
+  const IS_PF = !IS_APP && typeof F === 'object' && !!F && typeof F.login === 'function' && typeof ADMIN !== 'undefined';
+  if (!IS_APP && !IS_PF) return;
 
   const css = `
 .otp-ov{position:fixed;inset:0;z-index:90;display:grid;place-items:center;padding:16px;overflow-y:auto;transition:background .6s ease;background:color-mix(in srgb,#070F22 62%,transparent);backdrop-filter:blur(10px) saturate(1.2);-webkit-backdrop-filter:blur(10px) saturate(1.2);animation:otpIn .28s ease-out}
@@ -67,29 +69,59 @@
   const chName = id => (id === 'wa' ? 'WhatsApp' : 'email');
   let O = null; // state OTP aktif
 
-  /* ---------- Masuk ---------- */
-  const origLogin = srvLogin;
-  window.srvLogin = async function (fd) {
-    ui.lastId = String(fd.get('id'));
-    const btn = document.querySelector('form[data-f=login] button[type=submit]');
-    if (btn) { btn.disabled = true; btn.dataset.t = btn.textContent; btn.textContent = 'Memeriksa…'; }
-    try {
-      const j = await api('login', { id: String(fd.get('id')), pw: String(fd.get('pw')) });
-      if (j && j.otp) { ui.loginErr = ''; ui.loginCode = ''; openOtp(j); return; }
-      await finish(j, false);
-    } catch (err) { ui.loginErr = err.message; ui.loginCode = err.code || ''; render(); }
-    finally { if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = btn.dataset.t || 'Masuk'; } }
-  };
-  window.srvLoginNoOtp = origLogin;
+  /* ---------- Integrasi 1: aplikasi bazzar (app.html) ---------- */
+  let AD = null;
+  if (IS_APP) {
+    const finishApp = async j => {
+      U = j.user; ui.loginErr = ''; ui.loginCode = ''; ui.mustChange = !!j.mustChange;
+      if (!ui.mustChange) await pull();
+      view = U.kind === 'tenant' ? 'm_home' : 'dashboard'; SRV.lastAct = Date.now();
+      render();
+      if (ui.mustChange) A.pwChange({ force: 1 });
+    };
+    AD = { title: 'Verifikasi masuk', send: ch => api('otp_send', { channel: ch }), verify: code => api('otp_verify', { code }), after: finishApp,
+      expired: t => { ui.loginErr = t || 'Sesi verifikasi berakhir. Silakan masuk ulang.'; render(); },
+      cancel: () => { const i = document.getElementById('lg-pw'); if (i) { i.value = ''; i.focus(); } } };
+    window.srvLoginNoOtp = srvLogin;
+    window.srvLogin = async function (fd) {
+      ui.lastId = String(fd.get('id'));
+      const btn = document.querySelector('form[data-f=login] button[type=submit]');
+      if (btn) { btn.disabled = true; btn.dataset.t = btn.textContent; btn.textContent = 'Memeriksa…'; }
+      try {
+        const j = await api('login', { id: String(fd.get('id')), pw: String(fd.get('pw')) });
+        if (j && j.otp) { ui.loginErr = ''; ui.loginCode = ''; openOtp(j); return; }
+        await finishApp(j); window.scrollTo(0, 0);
+      } catch (err) { ui.loginErr = err.message; ui.loginCode = err.code || ''; render(); }
+      finally { if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = btn.dataset.t || 'Masuk'; } }
+    };
+  }
 
-  /** Selesaikan masuk seperti srvLogin asli. */
-  async function finish(j, animated) {
-    U = j.user; ui.loginErr = ''; ui.loginCode = ''; ui.mustChange = !!j.mustChange;
-    if (!ui.mustChange) await pull();
-    view = U.kind === 'tenant' ? 'm_home' : 'dashboard'; SRV.lastAct = Date.now();
-    render();
-    if (ui.mustChange) A.pwChange({ force: 1 });
-    if (!animated) window.scrollTo(0, 0);
+  /* ---------- Integrasi 2: Konsol Platform (platform.html) ---------- */
+  if (IS_PF) {
+    const papi = async (a, body) => {
+      const o = { method: body ? 'POST' : 'GET', credentials: 'same-origin', headers: { Accept: 'application/json' } };
+      if (body) { o.headers['Content-Type'] = 'application/json'; o.headers['X-CSRF'] = CSRF; o.body = JSON.stringify(body); }
+      let r, j = null;
+      try { r = await fetch('api.php?a=' + a, o); } catch (err) { throw new Error('Tidak dapat terhubung ke server'); }
+      try { j = await r.json(); } catch (err) { /* bukan JSON */ }
+      if (j && j.csrf) CSRF = j.csrf;
+      if (!r.ok || !j || j.ok === false) { const er = new Error((j && j.error) || ('Kode ' + r.status)); er.code = j && j.code; throw er; }
+      return j;
+    };
+    AD = { title: 'Verifikasi Konsol Platform', send: ch => papi('p_otp_send', { channel: ch }), verify: code => papi('p_otp_verify', { code }),
+      after: async () => { const me = await papi('p_me'); ADMIN = me.admin; D = null; render(); },
+      expired: t => toast(t || 'Sesi verifikasi berakhir. Silakan masuk ulang.'),
+      cancel: () => { const i = document.getElementById('pp'); if (i) { i.value = ''; i.focus(); } } };
+    F.login = async fd => {
+      const btn = document.querySelector('form[data-f=login] button[type=submit]');
+      if (btn) { btn.disabled = true; btn.dataset.t = btn.textContent; btn.textContent = 'Memeriksa…'; }
+      try {
+        const j = await papi('p_login', { email: fd.get('email'), pw: fd.get('pw') });
+        if (j && j.otp) { openOtp(j); return; }
+        await AD.after(j);
+      } catch (err) { toast(err.message); }
+      finally { if (btn && btn.isConnected) { btn.disabled = false; btn.textContent = btn.dataset.t || 'Masuk'; } }
+    };
   }
 
   /* ---------- Layar OTP ---------- */
@@ -99,7 +131,7 @@
     const ov = document.createElement('div');
     ov.className = 'otp-ov'; ov.id = 'otp-ov';
     ov.setAttribute('role', 'dialog'); ov.setAttribute('aria-modal', 'true'); ov.setAttribute('aria-labelledby', 'otp-t');
-    ov.innerHTML = `<div class="otp-card"><div class="otp-ico">${ICO}</div><h2 id="otp-t">Verifikasi masuk</h2><p class="otp-sub" id="otp-sub"></p>
+    ov.innerHTML = `<div class="otp-card"><div class="otp-ico">${ICO}</div><h2 id="otp-t">${AD.title}</h2><p class="otp-sub" id="otp-sub"></p>
       <form id="otp-f" autocomplete="off" novalidate><div class="otp-boxes" id="otp-b" role="group" aria-label="Kode OTP 6 digit">${[0, 1, 2, 3, 4, 5].map(i => `<input inputmode="numeric" pattern="[0-9]*" maxlength="1" aria-label="Digit ${i + 1}" ${i === 0 ? 'autocomplete="one-time-code"' : 'autocomplete="off"'}>`).join('')}</div>
       <div class="otp-msg" id="otp-m" aria-live="polite"></div><button class="btn pri otp-go" type="submit" id="otp-go">Verifikasi &amp; masuk</button></form>
       <div class="otp-meta" id="otp-meta"></div><div class="otp-alt" id="otp-alt"></div>
@@ -163,12 +195,12 @@
   async function resend(ch) {
     if (!O || O.busy) return;
     O.busy = true; msg('Mengirim kode lewat ' + chName(ch) + '…', true);
-    try { const j = await api('otp_send', { channel: ch }); paint(j); msg('Kode baru sudah dikirim lewat ' + chName(j.via) + '.', true); resetBoxes(); }
+    try { const j = await AD.send(ch); paint(j); msg('Kode baru sudah dikirim lewat ' + chName(j.via) + '.', true); resetBoxes(); }
     catch (err) { if (err.code === 'otp_expired') return expired(err.message); msg(err.message); }
     finally { if (O) O.busy = false; }
   }
   function resetBoxes() { document.getElementById('otp-b')?.classList.remove('bad'); document.querySelectorAll('#otp-b input').forEach(x => { x.value = ''; x.classList.remove('f'); }); const f = document.querySelector('#otp-b input'); f && f.focus(); }
-  function expired(t) { close(); ui.loginErr = t || 'Sesi verifikasi berakhir. Silakan masuk ulang.'; render(); }
+  function expired(t) { close(true); AD.expired(t); }
 
   async function verify(ins) {
     if (!O || O.busy) return;
@@ -176,7 +208,7 @@
     if (!/^\d{6}$/.test(code)) { msg('Masukkan 6 digit kode.'); return; }
     O.busy = true; const go = document.getElementById('otp-go'); go.disabled = true; go.textContent = 'Memverifikasi…'; msg('');
     try {
-      const j = await api('otp_verify', { code });
+      const j = await AD.verify(code);
       clearInterval(O.timer);
       await success(j, ins);
     } catch (err) {
@@ -192,7 +224,7 @@
   async function success(j, ins) {
     const ov = document.getElementById('otp-ov'), card = ov.querySelector('.otp-card');
     const name = (O.j && O.j.name) || '';
-    const data = (async () => { await finish(j, true); })();   // muat data dashboard di balik layar
+    const data = (async () => { await AD.after(j); })();   // muat data dashboard di balik layar
     if (reduce()) { try { await data; } catch (err) { toast(err.message || 'Gagal memuat data'); } ov.classList.add('out'); await wait(700); ov.remove(); O = null; return; }
     const rects = ins.map(x => x.getBoundingClientRect());
     const digits = ins.map(x => x.value);
@@ -236,6 +268,6 @@
     if (O) clearInterval(O.timer);
     O = null;
     if (ov) ov.remove();
-    if (!silent) { const i = document.getElementById('lg-pw'); if (i) { i.value = ''; i.focus(); } }
+    if (!silent && AD) AD.cancel();
   }
 })();

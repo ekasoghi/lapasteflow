@@ -13,9 +13,10 @@ const OTP_MAX_SEND = 5;     // pengiriman maksimal per proses masuk
 const OTP_WINDOW = 900;     // proses masuk harus selesai dalam 15 menit
 
 function otp_conf(): array {
-    $c = array_replace(['enabled' => true, 'scope' => 'all'], platform()['otp'] ?? []);
-    return ['enabled' => !empty($c['enabled']), 'scope' => $c['scope'] === 'staff' ? 'staff' : 'all'];
+    $c = array_replace(['enabled' => true, 'scope' => 'all', 'platform' => true, 'adminWa' => ''], platform()['otp'] ?? []);
+    return ['enabled' => !empty($c['enabled']), 'scope' => $c['scope'] === 'staff' ? 'staff' : 'all', 'platform' => !empty($c['platform']), 'adminWa' => norm_wa((string)$c['adminWa'])];
 }
+const OTP_PF = '__platform';   // penanda proses masuk Konsol Platform
 function otp_mask_wa(string $w): string { return strlen($w) < 8 ? $w : substr($w, 0, 4) . str_repeat('•', strlen($w) - 7) . substr($w, -3); }
 function otp_mask_email(string $e): string { [$u, $d] = array_pad(explode('@', $e, 2), 2, ''); return mb_substr($u, 0, 2) . '•••@' . $d; }
 
@@ -102,14 +103,14 @@ function otp_resend(array $W, string $via): array {
     if ((int)$o['sends'] >= OTP_MAX_SEND) fail('Batas pengiriman kode tercapai. Silakan masuk ulang beberapa saat lagi.', 429, 'otp_limit');
     $wait = OTP_RESEND - (time() - (int)$o['last']);
     if ($via === ($o['via'] ?? '') && $wait > 0) fail("Tunggu $wait detik sebelum mengirim ulang.", 429, 'otp_wait');
-    [$S] = state_load();
+    $S = $W['id'] === OTP_PF ? [] : state_load()[0];
     [$ok, $err] = otp_deliver($via, $S);
     if (!$ok) { error_log('[lapaste otp] gagal kirim: ' . $err); fail(($via === 'wa' ? 'WhatsApp' : 'Email') . ' belum terkirim. ' . (count($o['ch']) > 1 ? 'Coba saluran lain.' : 'Coba lagi atau hubungi pengelola bazzar.'), 502, 'otp_send'); }
     return ['ok' => true, 'otp' => true, 'sent' => true] + otp_public();
 }
 
-/** Cocokkan kode; bila benar, buat sesi seperti login biasa. */
-function otp_verify(array $W, string $code): array {
+/** Periksa kode. Mengembalikan data proses masuk bila benar; selain itu berhenti dengan pesan. */
+function otp_check(array $W, string $code, int $badHttp = 401): array {
     if (ip_blocked()) fail('Terlalu banyak percobaan dari jaringan ini. Coba lagi dalam 15 menit.', 429, 'rate');
     $o = otp_pending($W);
     $code = preg_replace('/\D/', '', $code);
@@ -119,8 +120,14 @@ function otp_verify(array $W, string $code): array {
         $_SESSION['otp']['tries'] = (int)$o['tries'] + 1; ip_note();
         $left = OTP_MAX_TRY - (int)$_SESSION['otp']['tries'];
         if ($left <= 0) { unset($_SESSION['otp']); fail('Terlalu banyak kode salah. Silakan masuk ulang.', 429, 'otp_expired'); }
-        fail("Kode tidak cocok. Sisa $left percobaan.", 401, 'otp_bad');
+        fail("Kode tidak cocok. Sisa $left percobaan.", $badHttp, 'otp_bad');
     }
+    return $o;
+}
+
+/** Cocokkan kode; bila benar, buat sesi seperti login biasa. */
+function otp_verify(array $W, string $code): array {
+    $o = otp_check($W, $code);
     $acc = acct_row_id((int)$o['acc']);
     [$S] = state_load();
     $rec = $acc ? find($S[$acc['kind'] === 'user' ? 'users' : 'tenants'], $acc['ref_id']) : null;
@@ -133,4 +140,41 @@ function otp_verify(array $W, string $code): array {
     $name = $acc['kind'] === 'user' ? $rec['name'] : $rec['owner'];
     with_state(function (&$S) use ($name, $acc, $rec, $via) { audit($S, $name, $acc['kind'] === 'user' ? $rec['role'] : 'Mitra Tenant', 'Masuk', "$name masuk dengan verifikasi OTP via " . ($via === 'wa' ? 'WhatsApp' : 'email') . ' dari IP ' . client_ip()); return ['save' => true]; });
     return ['ok' => true, 'user' => ['kind' => $acc['kind'], 'id' => $acc['ref_id']], 'mustChange' => (bool)$acc['must_change']];
+}
+
+/* ================= Konsol Platform (pemilik layanan) ================= */
+/** Saluran OTP pemilik platform: WhatsApp platform ke nomor OTP admin (atau WhatsApp dukungan) dan email akun admin. */
+function potp_channels(array $ad): array {
+    $c = otp_conf(); $ch = [];
+    $wa = $c['adminWa'] !== '' ? $c['adminWa'] : norm_wa((string)(platform()['supportWa'] ?? ''));
+    if (strlen($wa) >= 10 && wa_platform()['token'] !== '') $ch['wa'] = $wa;
+    $em = strtolower(trim((string)($ad['email'] ?? '')));
+    if (filter_var($em, FILTER_VALIDATE_EMAIL)) $ch['email'] = $em;
+    return $ch;
+}
+/**
+ * Dipanggil dari p_login setelah kata sandi benar. null = langsung masuk.
+ * Agar pemilik platform tidak pernah terkunci: bila tidak ada saluran, atau semua saluran gagal mengirim, masuk tanpa OTP (dicatat di error log).
+ */
+function potp_begin(array $ad): ?array {
+    if (!otp_conf()['platform']) return null;
+    $ch = potp_channels($ad);
+    if (!$ch) { error_log('[lapaste otp] Konsol Platform: tidak ada saluran OTP, masuk tanpa OTP'); return null; }
+    $_SESSION['otp'] = ['ws' => OTP_PF, 'acc' => (int)$ad['id'], 'kind' => 'padmin', 'ref' => '', 'mc' => 0, 'name' => (string)($ad['name'] ?? ''), 'role' => 'Pemilik platform',
+        'bz' => (string)(platform()['name'] ?? 'La Paste Bazzar Management'), 'ch' => $ch, 'h' => '', 'exp' => 0, 'tries' => 0, 'sends' => 0, 'last' => 0, 'via' => '', 'born' => time(), 'salt' => bin2hex(random_bytes(16))];
+    $first = isset($ch['wa']) ? 'wa' : 'email';
+    [$ok, $err] = otp_deliver($first, []);
+    if (!$ok && count($ch) > 1) { [$ok, $err2] = otp_deliver($first === 'wa' ? 'email' : 'wa', []); if (!$ok) $err .= ' · ' . $err2; }
+    if (!$ok) { unset($_SESSION['otp']); error_log('[lapaste otp] Konsol Platform: kode gagal terkirim (' . $err . '), masuk tanpa OTP'); return null; }
+    return ['ok' => true, 'otp' => true, 'sent' => true] + otp_public();
+}
+function potp_resend(string $via): array { return otp_resend(['id' => OTP_PF], $via); }
+function potp_verify(string $code): array {
+    $o = otp_check(['id' => OTP_PF], $code, 422);
+    $st = db()->prepare('SELECT id, name, email FROM lp_admins WHERE id = ?'); $st->execute([(int)$o['acc']]); $ad = $st->fetch();
+    if (!$ad) { unset($_SESSION['otp']); fail('Akun tidak ditemukan.', 404, 'otp_expired'); }
+    session_regenerate_id(true);
+    $_SESSION = ['padmin' => (int)$ad['id'], 'born' => time(), 'last' => time(), 'csrf' => bin2hex(random_bytes(32))];
+    db()->prepare('UPDATE lp_admins SET last_login = ? WHERE id = ?')->execute([time(), $ad['id']]);
+    return ['ok' => true, 'name' => (string)$ad['name']];
 }
